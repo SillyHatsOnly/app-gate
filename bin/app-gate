@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# app-gate — allow an app only during configured time windows.
+# Usage: app-gate <app-id> <command> [args...]
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Resolve symlinks so `~/.local/bin/app-gate` still finds the repo root.
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do
+  _DIR="$(cd "$(dirname "$_SOURCE")" && pwd)"
+  _SOURCE="$(readlink "$_SOURCE")"
+  [[ "$_SOURCE" != /* ]] && _SOURCE="$_DIR/$_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_SOURCE")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+unset _SOURCE _DIR
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+APPS_DIR="${APP_GATE_APPS_DIR:-$XDG_CONFIG_HOME/app-gate/apps}"
+STATE_ROOT="${APP_GATE_STATE_DIR:-$XDG_STATE_HOME/app-gate}"
+
+APP_ID=""
+CONFIG=""
+STATE_DIR=""
+UNLOCK_FILE=""
+
+die() { echo "app-gate: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+app-gate v${VERSION} — schedule-gated app launcher
+
+Usage:
+  app-gate <app-id> status
+  app-gate <app-id> open [--] [args...]
+  app-gate <app-id> enforce
+  app-gate <app-id> unlock [minutes]
+  app-gate <app-id> lock
+  app-gate <app-id> edit
+  app-gate install <app-id> [--from PATH]
+  app-gate uninstall <app-id>
+  app-gate list
+  app-gate --help
+
+App configs live in: ${APPS_DIR}/<app-id>.conf
+Examples in repo:    ${REPO_ROOT}/examples/
+EOF
+}
+
+require_app() {
+  APP_ID="${1:-}"
+  [[ -n "$APP_ID" ]] || die "missing app-id"
+  [[ "$APP_ID" =~ ^[a-zA-Z0-9_-]+$ ]] || die "invalid app-id: $APP_ID"
+  CONFIG="$APPS_DIR/${APP_ID}.conf"
+  STATE_DIR="$STATE_ROOT/$APP_ID"
+  UNLOCK_FILE="$STATE_DIR/unlock_until"
+  mkdir -p "$STATE_DIR"
+}
+
+# Defaults — overridden by each app config
+APP_NAME="App"
+WINDOWS="12:00-12:15,18:00-18:30"
+UNLOCK_PIN=""
+LAUNCH_MODE="command"   # command | flatpak
+LAUNCH_CMD=""
+FLATPAK_ID=""
+FLATPAK_ARGS="--branch=stable --arch=x86_64"
+STOP_CMD=""
+PROCESS_PATTERNS=""     # newline or comma separated substrings of cmdline
+DESKTOP_NAME=""
+DESKTOP_ICON="application-x-executable"
+DESKTOP_CATEGORIES="Utility;"
+DESKTOP_STARTUP_WMCLASS=""
+DESKTOP_FILENAME=""     # optional override for ~/.local/share/applications/
+
+load_config() {
+  [[ -f "$CONFIG" ]] || die "config not found: $CONFIG (try: app-gate install $APP_ID)"
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+  [[ -n "$APP_NAME" ]] || APP_NAME="$APP_ID"
+}
+
+now_minutes() {
+  date +%H:%M | awk -F: '{print $1*60+$2}'
+}
+
+parse_hm() {
+  local hm="$1" h m
+  h="${hm%%:*}"
+  m="${hm##*:}"
+  echo $((10#$h * 60 + 10#$m))
+}
+
+in_window() {
+  local window="$1" start end now s e
+  start="${window%%-*}"
+  end="${window##*-}"
+  now="$(now_minutes)"
+  s="$(parse_hm "$start")"
+  e="$(parse_hm "$end")"
+  if (( s <= e )); then
+    if (( now >= s && now < e )); then return 0; else return 1; fi
+  else
+    if (( now >= s || now < e )); then return 0; else return 1; fi
+  fi
+}
+
+unlock_active() {
+  [[ -f "$UNLOCK_FILE" ]] || return 1
+  local until now
+  until="$(cat "$UNLOCK_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if (( now < until )); then
+    return 0
+  fi
+  rm -f "$UNLOCK_FILE"
+  return 1
+}
+
+in_schedule_window() {
+  load_config
+  local w
+  IFS=',' read -ra parts <<< "$WINDOWS"
+  for w in "${parts[@]}"; do
+    w="$(echo "$w" | tr -d '[:space:]')"
+    [[ -z "$w" ]] && continue
+    if in_window "$w"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_allowed() {
+  if unlock_active; then
+    return 0
+  fi
+  in_schedule_window
+}
+
+patterns_list() {
+  load_config
+  local raw="$PROCESS_PATTERNS"
+  if [[ -z "$raw" && "$LAUNCH_MODE" == "flatpak" && -n "$FLATPAK_ID" ]]; then
+    raw="$FLATPAK_ID"
+  fi
+  if [[ -z "$raw" && -n "$LAUNCH_CMD" ]]; then
+    # first token of launch command as weak fallback
+    raw="$(awk '{print $1}' <<<"$LAUNCH_CMD")"
+  fi
+  echo "$raw" | tr ',' '\n' | sed '/^[[:space:]]*$/d'
+}
+
+app_running() {
+  load_config
+  if [[ "$LAUNCH_MODE" == "flatpak" && -n "$FLATPAK_ID" ]]; then
+    if flatpak ps 2>/dev/null | grep -q "$FLATPAK_ID"; then
+      return 0
+    fi
+  fi
+  local pat
+  while IFS= read -r pat; do
+    [[ -z "$pat" ]] && continue
+    if pgrep -f -- "$pat" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < <(patterns_list)
+  return 1
+}
+
+kill_app() {
+  load_config
+  if [[ -n "$STOP_CMD" ]]; then
+    # intentional word-splitting for user-provided command line
+    # shellcheck disable=SC2086
+    bash -c "$STOP_CMD" >/dev/null 2>&1 || true
+  fi
+  if [[ "$LAUNCH_MODE" == "flatpak" && -n "$FLATPAK_ID" ]]; then
+    flatpak kill "$FLATPAK_ID" 2>/dev/null || true
+  fi
+  local pat
+  while IFS= read -r pat; do
+    [[ -z "$pat" ]] && continue
+    pkill -f -- "$pat" 2>/dev/null || true
+  done < <(patterns_list)
+  sleep 0.3
+  while IFS= read -r pat; do
+    [[ -z "$pat" ]] && continue
+    pkill -9 -f -- "$pat" 2>/dev/null || true
+  done < <(patterns_list)
+}
+
+notify() {
+  local title="$1" body="$2"
+  if command -v notify-send >/dev/null; then
+    notify-send -u normal "$title" "$body" || true
+  fi
+}
+
+notify_blocked() {
+  load_config
+  if unlock_active; then
+    return 0
+  fi
+  notify "app-gate:$APP_ID" "$APP_NAME closed outside windows: $WINDOWS"
+}
+
+next_window_hint() {
+  load_config
+  local w start s now best=99999 best_label="" candidate
+  now="$(now_minutes)"
+  IFS=',' read -ra parts <<< "$WINDOWS"
+  for w in "${parts[@]}"; do
+    w="$(echo "$w" | tr -d '[:space:]')"
+    [[ -z "$w" ]] && continue
+    start="${w%%-*}"
+    s="$(parse_hm "$start")"
+    if (( s >= now )); then
+      candidate=$((s - now))
+    else
+      candidate=$((s + 1440 - now))
+    fi
+    if (( candidate < best )); then
+      best=$candidate
+      best_label="$w (in ${best} min)"
+    fi
+  done
+  echo "$best_label"
+}
+
+cmd_status() {
+  require_app "$1"
+  load_config
+  echo "app:     $APP_ID ($APP_NAME)"
+  echo "config:  $CONFIG"
+  echo "windows: $WINDOWS"
+  if unlock_active; then
+    local until left
+    until="$(cat "$UNLOCK_FILE")"
+    left=$(( until - $(date +%s) ))
+    echo "unlock:  active (${left}s left)"
+    echo "now:     ALLOWED (unlock)"
+  else
+    echo "unlock:  inactive"
+    if in_schedule_window; then
+      echo "now:     ALLOWED (schedule)"
+    else
+      echo "now:     BLOCKED"
+    fi
+  fi
+  if app_running; then
+    echo "process: running"
+  else
+    echo "process: not running"
+  fi
+  local next
+  next="$(next_window_hint || true)"
+  [[ -n "${next:-}" ]] && echo "next:    $next"
+}
+
+cmd_open() {
+  require_app "$1"
+  shift
+  # optional --
+  if [[ "${1:-}" == "--" ]]; then shift; fi
+  load_config
+  if ! is_allowed; then
+    notify_blocked
+    if command -v zenity >/dev/null; then
+      zenity --info --title="app-gate:$APP_ID" \
+        --text="$APP_NAME is closed right now.\n\nWindows: ${WINDOWS}\n\nNext: $(next_window_hint)\n\nEmergency: app-gate $APP_ID unlock 15" \
+        2>/dev/null || true
+    fi
+    exit 1
+  fi
+  case "$LAUNCH_MODE" in
+    flatpak)
+      [[ -n "$FLATPAK_ID" ]] || die "FLATPAK_ID is empty"
+      # shellcheck disable=SC2086
+      exec flatpak run $FLATPAK_ARGS "$FLATPAK_ID" "$@"
+      ;;
+    command)
+      [[ -n "$LAUNCH_CMD" ]] || die "LAUNCH_CMD is empty"
+      # shellcheck disable=SC2086
+      exec $LAUNCH_CMD "$@"
+      ;;
+    *)
+      die "unknown LAUNCH_MODE: $LAUNCH_MODE (use command|flatpak)"
+      ;;
+  esac
+}
+
+cmd_enforce() {
+  require_app "$1"
+  load_config
+
+  # 1) unlock expired → always kill (not OR with schedule)
+  if [[ -f "$UNLOCK_FILE" ]]; then
+    local until now
+    until="$(cat "$UNLOCK_FILE" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    if (( now < until )); then
+      exit 0
+    fi
+    rm -f "$UNLOCK_FILE"
+    if app_running; then
+      kill_app
+      notify "app-gate:$APP_ID" "Unlock expired — $APP_NAME closed"
+    fi
+    exit 0
+  fi
+
+  # 2) schedule
+  if in_schedule_window; then
+    exit 0
+  fi
+  if app_running; then
+    kill_app
+    notify_blocked
+  fi
+}
+
+cmd_unlock() {
+  require_app "$1"
+  load_config
+  local minutes="${2:-15}"
+  if ! [[ "$minutes" =~ ^[0-9]+$ ]] || (( minutes < 1 || minutes > 2400 )); then
+    die "usage: app-gate $APP_ID unlock <minutes 1-2400>"
+  fi
+  if [[ -n "$UNLOCK_PIN" ]]; then
+    local pin
+    if command -v zenity >/dev/null; then
+      pin="$(zenity --password --title="app-gate:$APP_ID unlock" 2>/dev/null || true)"
+    else
+      read -r -s -p "PIN: " pin
+      echo
+    fi
+    if [[ "$pin" != "$UNLOCK_PIN" ]]; then
+      echo "wrong PIN" >&2
+      notify "app-gate:$APP_ID" "Wrong PIN"
+      exit 1
+    fi
+  fi
+  echo $(( $(date +%s) + minutes * 60 )) > "$UNLOCK_FILE"
+  echo "unlocked $APP_ID for ${minutes} minutes"
+  notify "app-gate:$APP_ID" "$APP_NAME unlocked for ${minutes} min"
+}
+
+cmd_lock() {
+  require_app "$1"
+  load_config
+  rm -f "$UNLOCK_FILE"
+  kill_app
+  echo "locked; $APP_ID killed"
+  notify "app-gate:$APP_ID" "$APP_NAME locked"
+}
+
+cmd_edit() {
+  require_app "$1"
+  local editor="${EDITOR:-nano}"
+  [[ -f "$CONFIG" ]] || die "config not found: $CONFIG"
+  "$editor" "$CONFIG"
+  echo "saved."
+  cmd_status "$APP_ID"
+}
+
+desktop_path_for() {
+  load_config
+  local name="${DESKTOP_FILENAME:-app-gate-${APP_ID}.desktop}"
+  echo "$XDG_DATA_HOME/applications/$name"
+}
+
+write_desktop() {
+  load_config
+  local desktop bin_link
+  desktop="$(desktop_path_for)"
+  bin_link="$HOME/.local/bin/app-gate"
+  mkdir -p "$(dirname "$desktop")"
+  cat > "$desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=${APP_NAME}
+Comment=${APP_NAME} (app-gate — schedule only)
+Exec=${bin_link} ${APP_ID} open
+Icon=${DESKTOP_ICON}
+Terminal=false
+Categories=${DESKTOP_CATEGORIES}
+StartupWMClass=${DESKTOP_STARTUP_WMCLASS}
+EOF
+}
+
+write_systemd() {
+  local service timer unit_bin
+  unit_bin="$HOME/.local/bin/app-gate"
+  service="$XDG_CONFIG_HOME/systemd/user/app-gate@${APP_ID}.service"
+  timer="$XDG_CONFIG_HOME/systemd/user/app-gate@${APP_ID}.timer"
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+
+  cat > "$service" <<EOF
+[Unit]
+Description=app-gate enforce for ${APP_ID}
+
+[Service]
+Type=oneshot
+ExecStart=${unit_bin} ${APP_ID} enforce
+EOF
+
+  cat > "$timer" <<EOF
+[Unit]
+Description=Run app-gate enforce for ${APP_ID} every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=app-gate@${APP_ID}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "app-gate@${APP_ID}.timer"
+}
+
+cmd_install() {
+  local app="${1:-}" from=""
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        from="${2:-}"; shift 2 || die "--from needs PATH";;
+      *)
+        die "unknown install arg: $1";;
+    esac
+  done
+  require_app "$app"
+  mkdir -p "$APPS_DIR" "$HOME/.local/bin"
+
+  # install / refresh CLI symlink
+  ln -sfn "$REPO_ROOT/bin/app-gate" "$HOME/.local/bin/app-gate"
+
+  if [[ ! -f "$CONFIG" ]]; then
+    if [[ -n "$from" ]]; then
+      [[ -f "$from" ]] || die "example not found: $from"
+      cp "$from" "$CONFIG"
+    elif [[ -f "$REPO_ROOT/examples/${APP_ID}.conf" ]]; then
+      cp "$REPO_ROOT/examples/${APP_ID}.conf" "$CONFIG"
+    elif [[ -f "$REPO_ROOT/examples/generic.conf" ]]; then
+      cp "$REPO_ROOT/examples/generic.conf" "$CONFIG"
+      # soft-fill APP_NAME
+      sed -i "s/^APP_NAME=.*/APP_NAME=\"${APP_ID}\"/" "$CONFIG" 2>/dev/null || true
+    else
+      die "no config template; pass --from PATH"
+    fi
+    echo "wrote $CONFIG — edit PIN / paths before daily use"
+  else
+    echo "keeping existing $CONFIG"
+  fi
+
+  load_config
+  write_desktop
+  write_systemd
+  update-desktop-database "$XDG_DATA_HOME/applications" 2>/dev/null || true
+
+  echo "installed app-gate for $APP_ID"
+  echo "  config:  $CONFIG"
+  echo "  desktop: $(desktop_path_for)"
+  echo "  timer:   app-gate@${APP_ID}.timer"
+  cmd_status "$APP_ID"
+}
+
+cmd_uninstall() {
+  require_app "$1"
+  systemctl --user disable --now "app-gate@${APP_ID}.timer" 2>/dev/null || true
+  rm -f "$XDG_CONFIG_HOME/systemd/user/app-gate@${APP_ID}.service" \
+        "$XDG_CONFIG_HOME/systemd/user/app-gate@${APP_ID}.timer"
+  if [[ -f "$CONFIG" ]]; then
+    load_config
+    rm -f "$(desktop_path_for)"
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
+  update-desktop-database "$XDG_DATA_HOME/applications" 2>/dev/null || true
+  echo "uninstalled timer/desktop for $APP_ID (config kept at $CONFIG)"
+}
+
+cmd_list() {
+  mkdir -p "$APPS_DIR"
+  local f id
+  shopt -s nullglob
+  local files=("$APPS_DIR"/*.conf)
+  if (( ${#files[@]} == 0 )); then
+    echo "(no apps in $APPS_DIR)"
+    return 0
+  fi
+  for f in "${files[@]}"; do
+    id="$(basename "$f" .conf)"
+    APP_ID="$id"
+    CONFIG="$f"
+    STATE_DIR="$STATE_ROOT/$id"
+    UNLOCK_FILE="$STATE_DIR/unlock_until"
+    load_config
+    local state="BLOCKED"
+    if unlock_active; then state="UNLOCK"
+    elif in_schedule_window; then state="SCHEDULE"
+    fi
+    printf '%-16s %-20s %s\n' "$id" "$state" "$WINDOWS"
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    ""|-h|--help|help)
+      usage
+      ;;
+    --version|version)
+      echo "$VERSION"
+      ;;
+    list)
+      cmd_list
+      ;;
+    install)
+      shift
+      cmd_install "$@"
+      ;;
+    uninstall)
+      shift
+      cmd_uninstall "${1:-}"
+      ;;
+    *)
+      # app-id first
+      local app="$1"
+      local sub="${2:-status}"
+      shift 2 || shift || true
+      case "$sub" in
+        status) cmd_status "$app";;
+        open) cmd_open "$app" "$@";;
+        enforce) cmd_enforce "$app";;
+        unlock) cmd_unlock "$app" "${1:-15}";;
+        lock) cmd_lock "$app";;
+        edit) cmd_edit "$app";;
+        install) cmd_install "$app" "$@";;
+        uninstall) cmd_uninstall "$app";;
+        *) usage; exit 2;;
+      esac
+      ;;
+  esac
+}
+
+main "$@"

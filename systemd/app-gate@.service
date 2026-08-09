@@ -1,0 +1,12 @@
+# Example systemd user units (created automatically by `app-gate install`).
+# Kept here for documentation / manual installs.
+#
+# Enable:
+#   systemctl --user enable --now app-gate@telegram.timer
+
+[Unit]
+Description=app-gate enforce for %i
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/app-gate %i enforce

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run app-gate enforce for %i every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=app-gate@%i.service
+
+[Install]
+WantedBy=timers.target

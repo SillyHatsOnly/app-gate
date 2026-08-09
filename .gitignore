@@ -1,0 +1,10 @@
+# Local / editor noise
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Don't commit real PINs or machine-specific configs
+/local/
+*.local.conf
