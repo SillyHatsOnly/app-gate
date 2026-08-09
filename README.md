@@ -28,7 +28,7 @@ loops on a long computer workday.
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR_USER/app-gate.git
+git clone https://github.com/SillyHatsOnly/app-gate.git
 cd app-gate
 chmod +x bin/app-gate
 
