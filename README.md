@@ -95,9 +95,9 @@ Modes: **ban** (no access) · **open** (free) · **strict** / **weekend** (unloc
 |------|------|
 | 00:00–09:00 | ban |
 | 09:00–10:00 | open |
-| 10:00–20:00 | strict |
-| 20:00–22:00 | open |
-| 22:00–24:00 | ban |
+| 10:00–19:00 | strict |
+| 19:00–20:30 | open |
+| 20:30–24:00 | ban |
 
 ### Tuesday / Thursday
 
@@ -106,9 +106,9 @@ Modes: **ban** (no access) · **open** (free) · **strict** / **weekend** (unloc
 | 00:00–03:00 | ban |
 | 03:00–05:00 | open (early tourism) |
 | 05:00–09:00 | ban |
-| 09:00–20:00 | strict |
-| 20:00–22:00 | open |
-| 22:00–24:00 | ban |
+| 09:00–19:00 | strict |
+| 19:00–20:30 | open |
+| 20:30–24:00 | ban |
 
 ### Saturday / Sunday
 
