@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# tg-gate — schedule-gated Telegram (Flatpak) with strict unlock.
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/tg-gate/config"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tg-gate"
+UNLOCK_FILE="$STATE_DIR/unlock_until"
+PENDING_FILE="$STATE_DIR/unlock_pending"
+USAGE_FILE="$STATE_DIR/daily_usage"
+COOLDOWN_FILE="$STATE_DIR/cooldown_until"
+AUDIT_LOG="$STATE_DIR/audit.log"
+FLATPAK_ID_DEFAULT="org.telegram.desktop"
+
+# Hard limits (not editable via impulse `tg-gate edit`)
+WEEKDAY_MAX_MINUTES=5
+WEEKDAY_DAILY_BUDGET=30
+WEEKEND_MAX_MINUTES=20
+WEEKEND_DAILY_BUDGET=120
+DEFAULT_DELAY_MINUTES=10
+DEFAULT_COOLDOWN_MINUTES=180
+DEFAULT_PHRASE="i need telegram"
+
+mkdir -p "$STATE_DIR"
+
+audit() {
+  printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$AUDIT_LOG"
+}
+
+today() { date +%F; }
+
+load_config() {
+  FLATPAK_ID="$FLATPAK_ID_DEFAULT"
+  CONFIRM_PHRASE="$DEFAULT_PHRASE"
+  UNLOCK_DELAY_MINUTES="$DEFAULT_DELAY_MINUTES"
+  UNLOCK_COOLDOWN_MINUTES="$DEFAULT_COOLDOWN_MINUTES"
+  if [[ -f "$CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+  fi
+}
+
+now_minutes() {
+  date +%H:%M | awk -F: '{print $1*60+$2}'
+}
+
+# 1=Mon ... 7=Sun
+dow() { date +%u; }
+
+# Prints: ban | open | strict | weekend
+current_mode() {
+  local d n
+  d="$(dow)"
+  n="$(now_minutes)"
+
+  if (( d >= 6 )); then
+    echo weekend
+    return
+  fi
+
+  case "$d" in
+    1|3|5) # Mon Wed Fri
+      if (( n < 9 * 60 )); then echo ban
+      elif (( n < 10 * 60 )); then echo open
+      elif (( n < 20 * 60 )); then echo strict
+      elif (( n < 22 * 60 )); then echo open
+      else echo ban
+      fi
+      ;;
+    2|4) # Tue Thu
+      if (( n < 3 * 60 )); then echo ban
+      elif (( n < 5 * 60 )); then echo open
+      elif (( n < 9 * 60 )); then echo ban
+      elif (( n < 20 * 60 )); then echo strict
+      elif (( n < 22 * 60 )); then echo open
+      else echo ban
+      fi
+      ;;
+    *)
+      echo ban
+      ;;
+  esac
+}
+
+max_unlock_minutes() {
+  case "$(current_mode)" in
+    weekend) echo "$WEEKEND_MAX_MINUTES" ;;
+    strict) echo "$WEEKDAY_MAX_MINUTES" ;;
+    *) echo 0 ;;
+  esac
+}
+
+daily_budget() {
+  local d
+  d="$(dow)"
+  if (( d >= 6 )); then
+    echo "$WEEKEND_DAILY_BUDGET"
+  else
+    echo "$WEEKDAY_DAILY_BUDGET"
+  fi
+}
+
+daily_used() {
+  [[ -f "$USAGE_FILE" ]] || { echo 0; return; }
+  local day used
+  read -r day used < "$USAGE_FILE" || true
+  if [[ "$day" != "$(today)" ]]; then
+    echo 0
+  else
+    echo "${used:-0}"
+  fi
+}
+
+daily_add() {
+  local add="$1" used
+  used="$(daily_used)"
+  echo "$(today) $((used + add))" > "$USAGE_FILE"
+}
+
+budget_left() {
+  local used budget left
+  used="$(daily_used)"
+  budget="$(daily_budget)"
+  left=$((budget - used))
+  (( left < 0 )) && left=0
+  echo "$left"
+}
+
+print_budget() {
+  local used budget left
+  used="$(daily_used)"
+  budget="$(daily_budget)"
+  left="$(budget_left)"
+  echo "Дневной лимит: ${budget}м, использовано: ${used}м, осталось: ${left}м"
+}
+
+cooldown_active() {
+  load_config
+  [[ -f "$COOLDOWN_FILE" ]] || return 1
+  local until now
+  until="$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if (( now < until )); then
+    return 0
+  fi
+  rm -f "$COOLDOWN_FILE"
+  return 1
+}
+
+start_cooldown() {
+  load_config
+  echo $(( $(date +%s) + UNLOCK_COOLDOWN_MINUTES * 60 )) > "$COOLDOWN_FILE"
+}
+
+unlock_active() {
+  [[ -f "$UNLOCK_FILE" ]] || return 1
+  local until now
+  until="$(cat "$UNLOCK_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  if (( now < until )); then
+    return 0
+  fi
+  rm -f "$UNLOCK_FILE"
+  return 1
+}
+
+is_allowed() {
+  if unlock_active; then
+    return 0
+  fi
+  case "$(current_mode)" in
+    open) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+telegram_running() {
+  load_config
+  if flatpak ps 2>/dev/null | grep -q "$FLATPAK_ID"; then
+    return 0
+  fi
+  pgrep -x Telegram >/dev/null 2>&1
+}
+
+kill_telegram() {
+  load_config
+  flatpak kill "$FLATPAK_ID" 2>/dev/null || true
+  pkill -x Telegram 2>/dev/null || true
+}
+
+notify_blocked() {
+  local mode
+  mode="$(current_mode)"
+  if unlock_active; then
+    return 0
+  fi
+  if command -v notify-send >/dev/null; then
+    notify-send -u normal "tg-gate" "Telegram закрыт (режим: ${mode})" || true
+  fi
+}
+
+mode_label() {
+  case "$1" in
+    ban) echo "BAN (доступ запрещён)" ;;
+    open) echo "OPEN (свободный доступ)" ;;
+    strict) echo "STRICT (только unlock ≤${WEEKDAY_MAX_MINUTES}м, budget ${WEEKDAY_DAILY_BUDGET}м)" ;;
+    weekend) echo "WEEKEND (unlock ≤${WEEKEND_MAX_MINUTES}м, budget ${WEEKEND_DAILY_BUDGET}м)" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+cmd_status() {
+  load_config
+  local mode
+  mode="$(current_mode)"
+  echo "config:   $CONFIG (immutable)"
+  echo "mode:     $mode — $(mode_label "$mode")"
+  echo "delay:    ${UNLOCK_DELAY_MINUTES}m | cooldown: ${UNLOCK_COOLDOWN_MINUTES}m"
+  print_budget
+  if cooldown_active; then
+    local cu cl
+    cu="$(cat "$COOLDOWN_FILE")"
+    cl=$(( cu - $(date +%s) ))
+    echo "cooldown: active (${cl}s / ~$(( (cl + 59) / 60 ))m left)"
+  else
+    echo "cooldown: inactive"
+  fi
+  if [[ -f "$PENDING_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$PENDING_FILE"
+    local wait=$(( EARLIEST - $(date +%s) ))
+    if (( wait > 0 )); then
+      echo "pending:  ${MINUTES}m — ждать ещё ${wait}s, затем: tg-gate unlock-confirm"
+    else
+      echo "pending:  ${MINUTES}m — READY → tg-gate unlock-confirm"
+    fi
+  else
+    echo "pending:  none"
+  fi
+  if unlock_active; then
+    local until left
+    until="$(cat "$UNLOCK_FILE")"
+    left=$(( until - $(date +%s) ))
+    echo "unlock:   active (${left}s left)"
+    echo "now:      ALLOWED (unlock)"
+  else
+    echo "unlock:   inactive"
+    if is_allowed; then
+      echo "now:      ALLOWED (open period)"
+    else
+      echo "now:      BLOCKED"
+    fi
+  fi
+  if telegram_running; then
+    echo "process:  running"
+  else
+    echo "process:  not running"
+  fi
+}
+
+ask_phrase() {
+  load_config
+  local phrase
+  echo
+  echo "=== Подтверждение ==="
+  echo "Введите фразу точно:"
+  echo "  ${CONFIRM_PHRASE}"
+  echo
+  echo "После ответа начнётся ожидание ${UNLOCK_DELAY_MINUTES} мин."
+  echo "Доступ откроется только после: tg-gate unlock-confirm"
+  echo
+
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    read -r -p "Фраза: " phrase
+  elif command -v zenity >/dev/null; then
+    phrase="$(zenity --entry --title="tg-gate" \
+      --text="Введите точно:\n${CONFIRM_PHRASE}\n\nПосле ответа — ожидание ${UNLOCK_DELAY_MINUTES} мин,\nзатем: tg-gate unlock-confirm" \
+      2>/dev/null || true)"
+  else
+    echo "Нужен интерактивный терминал или zenity" >&2
+    exit 1
+  fi
+
+  if [[ "$phrase" != "$CONFIRM_PHRASE" ]]; then
+    echo "Неверная фраза." >&2
+    audit "unlock-ask wrong phrase"
+    exit 1
+  fi
+}
+
+cmd_unlock() {
+  load_config
+  local minutes="${1:-5}"
+  local mode max budget used left
+
+  mode="$(current_mode)"
+  case "$mode" in
+    ban)
+      echo "Сейчас BAN — unlock недоступен." >&2
+      audit "unlock-ask refused ban"
+      exit 1
+      ;;
+    open)
+      echo "Сейчас OPEN — unlock не нужен, просто открой Telegram." >&2
+      exit 1
+      ;;
+    strict|weekend) ;;
+    *)
+      echo "Неизвестный режим: $mode" >&2
+      exit 1
+      ;;
+  esac
+
+  if ! [[ "$minutes" =~ ^[0-9]+$ ]] || (( minutes < 1 )); then
+    echo "usage: tg-gate unlock <minutes>" >&2
+    exit 2
+  fi
+
+  max="$(max_unlock_minutes)"
+  if (( minutes > max )); then
+    echo "Отказ: максимум за раз ${max}м (просили ${minutes}м)." >&2
+    audit "unlock-ask refused max minutes=$minutes max=$max"
+    exit 1
+  fi
+
+  budget="$(daily_budget)"
+  used="$(daily_used)"
+  left="$(budget_left)"
+  if (( minutes > left )); then
+    echo "Отказ: на сегодня осталось ${left}м (использовано ${used}/${budget})." >&2
+    audit "unlock-ask refused budget minutes=$minutes left=$left"
+    exit 1
+  fi
+
+  if cooldown_active; then
+    local cu cl
+    cu="$(cat "$COOLDOWN_FILE")"
+    cl=$(( cu - $(date +%s) ))
+    echo "Отказ: cooldown ещё ~$(( (cl + 59) / 60 ))м (${cl}s)." >&2
+    audit "unlock-ask refused cooldown left=$cl"
+    exit 1
+  fi
+
+  if unlock_active; then
+    echo "Уже разблокировано — дождись окончания." >&2
+    exit 1
+  fi
+
+  ask_phrase
+
+  local earliest
+  earliest=$(( $(date +%s) + UNLOCK_DELAY_MINUTES * 60 ))
+  cat > "$PENDING_FILE" <<EOF
+MINUTES=$minutes
+EARLIEST=$earliest
+REQUESTED_AT=$(date +%s)
+EOF
+  audit "unlock-ask accepted minutes=$minutes delay=${UNLOCK_DELAY_MINUTES}m"
+
+  echo
+  echo "Заявка принята: ${minutes}м"
+  echo "Ждите ${UNLOCK_DELAY_MINUTES} минут, затем выполните:"
+  echo "  tg-gate unlock-confirm"
+  echo "После подтверждения Telegram откроется на ${minutes}м, затем cooldown ${UNLOCK_COOLDOWN_MINUTES}м."
+  print_budget
+  echo "После этой сессии осталось бы: $((left - minutes))м"
+  notify-send "tg-gate" \
+    "Фраза ок. Жди ${UNLOCK_DELAY_MINUTES} мин → tg-gate unlock-confirm (${minutes}м)" \
+    2>/dev/null || true
+}
+
+cmd_unlock_confirm() {
+  load_config
+  local mode now used budget left
+
+  [[ -f "$PENDING_FILE" ]] || {
+    echo "Нет заявки. Сначала: tg-gate unlock <minutes>" >&2
+    exit 1
+  }
+
+  mode="$(current_mode)"
+  case "$mode" in
+    strict|weekend) ;;
+    ban)
+      echo "Сейчас BAN — подтверждение отменено." >&2
+      rm -f "$PENDING_FILE"
+      audit "unlock-confirm refused ban"
+      exit 1
+      ;;
+    open)
+      echo "Сейчас OPEN — pending сброшен, открой Telegram напрямую." >&2
+      rm -f "$PENDING_FILE"
+      exit 1
+      ;;
+  esac
+
+  # shellcheck disable=SC1090
+  source "$PENDING_FILE"
+  now="$(date +%s)"
+  if (( now < EARLIEST )); then
+    echo "Рано: подождите ещё $((EARLIEST - now))s (~$(( (EARLIEST - now + 59) / 60 ))м)." >&2
+    audit "unlock-confirm too-early wait=$((EARLIEST - now))"
+    exit 1
+  fi
+
+  left="$(budget_left)"
+  if (( MINUTES > left )); then
+    echo "Отказ: бюджет изменился, осталось ${left}м." >&2
+    rm -f "$PENDING_FILE"
+    exit 1
+  fi
+  if cooldown_active; then
+    echo "Отказ: активен cooldown." >&2
+    rm -f "$PENDING_FILE"
+    exit 1
+  fi
+
+  local max
+  max="$(max_unlock_minutes)"
+  if (( MINUTES > max )); then
+    echo "Отказ: лимит слота сейчас ${max}м." >&2
+    rm -f "$PENDING_FILE"
+    exit 1
+  fi
+
+  echo $(( now + MINUTES * 60 )) > "$UNLOCK_FILE"
+  daily_add "$MINUTES"
+  rm -f "$PENDING_FILE"
+  audit "unlock-confirm minutes=$MINUTES"
+
+  echo "Разблокировано на ${MINUTES} минут."
+  print_budget
+  notify-send "tg-gate" \
+    "Telegram на ${MINUTES}м. $(print_budget)" \
+    2>/dev/null || true
+}
+
+cmd_lock() {
+  load_config
+  rm -f "$UNLOCK_FILE" "$PENDING_FILE"
+  kill_telegram
+  start_cooldown
+  audit "lock"
+  echo "Закрыто. Cooldown ${UNLOCK_COOLDOWN_MINUTES}м."
+  print_budget
+  notify-send "tg-gate" "Telegram закрыт + cooldown" 2>/dev/null || true
+}
+
+cmd_open() {
+  load_config
+  if ! is_allowed; then
+    notify_blocked
+    local mode
+    mode="$(current_mode)"
+    if command -v zenity >/dev/null; then
+      zenity --info --title="tg-gate" \
+        --text="Telegram закрыт.\nРежим: ${mode}\n\nЕсли STRICT/WEEKEND:\n1) tg-gate unlock N\n2) ввести фразу\n3) ждать ${UNLOCK_DELAY_MINUTES} мин\n4) tg-gate unlock-confirm" \
+        2>/dev/null || true
+    fi
+    echo "BLOCKED (mode=$(current_mode)). См. tg-gate status" >&2
+    exit 1
+  fi
+  exec flatpak run --branch=stable --arch=x86_64 --command=Telegram \
+    --file-forwarding "$FLATPAK_ID" -- "$@"
+}
+
+cmd_enforce() {
+  load_config
+
+  if [[ -f "$UNLOCK_FILE" ]]; then
+    local until now
+    until="$(cat "$UNLOCK_FILE" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    if (( now < until )); then
+      exit 0
+    fi
+    rm -f "$UNLOCK_FILE"
+    start_cooldown
+    audit "unlock-expired cooldown=${UNLOCK_COOLDOWN_MINUTES}m"
+    if telegram_running; then
+      kill_telegram
+      notify-send -u normal "tg-gate" "Unlock истёк — закрыто + cooldown" 2>/dev/null || true
+    fi
+    exit 0
+  fi
+
+  case "$(current_mode)" in
+    open)
+      exit 0
+      ;;
+    ban|strict|weekend)
+      if telegram_running; then
+        kill_telegram
+        notify_blocked
+        audit "enforce kill mode=$(current_mode)"
+      fi
+      ;;
+  esac
+}
+
+cmd_edit() {
+  echo "edit отключён. Конфиг защищён (chattr +i)." >&2
+  echo "Расписание зашито в скрипт — импульсные правки WINDOWS больше не работают." >&2
+  audit "edit refused"
+  exit 1
+}
+
+cmd_install() {
+  local bin="$HOME/.local/bin/tg-gate"
+  local desktop="$HOME/.local/share/applications/org.telegram.desktop.desktop"
+  local service="$HOME/.config/systemd/user/tg-gate.service"
+  local timer="$HOME/.config/systemd/user/tg-gate.timer"
+
+  mkdir -p "$(dirname "$desktop")" "$HOME/.config/systemd/user" "$(dirname "$CONFIG")"
+  mkdir -p "$HOME/.local/bin"
+  # Prefer repo copy when this file lives in a git checkout
+  if [[ -f "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/tg-gate" ]]; then
+    ln -sfn "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")" "$bin"
+  elif [[ "$(readlink -f "$0" 2>/dev/null || true)" != "$(readlink -f "$bin" 2>/dev/null || true)" ]]; then
+    cp -f "$0" "$bin" 2>/dev/null || ln -sfn "$0" "$bin"
+    chmod +x "$bin"
+  fi
+
+  if [[ ! -f "$CONFIG" ]]; then
+    cat > "$CONFIG" <<'EOF'
+# Schedule modes are hardcoded in tg-gate. Protect this file:
+#   chmod 444 ~/.config/tg-gate/config
+#   sudo chattr +i ~/.config/tg-gate/config
+
+FLATPAK_ID=org.telegram.desktop
+CONFIRM_PHRASE="i need telegram"
+UNLOCK_DELAY_MINUTES=10
+UNLOCK_COOLDOWN_MINUTES=180
+EOF
+    chmod 444 "$CONFIG" || true
+    echo "wrote $CONFIG (chmod 444)"
+  fi
+
+  cat > "$desktop" <<EOF
+[Desktop Entry]
+Name=Telegram
+Comment=Telegram (tg-gate schedule)
+Exec=$bin open
+Icon=org.telegram.desktop
+Terminal=false
+StartupWMClass=TelegramDesktop
+Type=Application
+Categories=Chat;Network;InstantMessaging;Qt;
+MimeType=x-scheme-handler/tg;x-scheme-handler/tonsite;
+Keywords=tg;chat;im;messaging;messenger;sms;tdesktop;
+SingleMainWindow=true
+X-GNOME-UsesNotifications=true
+NoDisplay=false
+EOF
+
+  cat > "$service" <<EOF
+[Unit]
+Description=tg-gate enforce Telegram schedule
+
+[Service]
+Type=oneshot
+ExecStart=$bin enforce
+EOF
+
+  cat > "$timer" <<EOF
+[Unit]
+Description=Run tg-gate enforce every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=tg-gate.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now tg-gate.timer
+  update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+  rm -f "$HOME/.config/autostart/org.telegram.desktop.desktop" 2>/dev/null || true
+  echo "installed."
+  cmd_status
+}
+
+cmd_uninstall() {
+  systemctl --user disable --now tg-gate.timer 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/tg-gate.service" \
+        "$HOME/.config/systemd/user/tg-gate.timer" \
+        "$HOME/.local/share/applications/org.telegram.desktop.desktop"
+  systemctl --user daemon-reload 2>/dev/null || true
+  echo "uninstalled timer/desktop (script+config kept)"
+}
+
+usage() {
+  cat <<EOF
+tg-gate — Telegram по расписанию + strict unlock
+
+  tg-gate status
+  tg-gate open
+  tg-gate unlock [мин]       фраза → ожидание ${DEFAULT_DELAY_MINUTES}м
+  tg-gate unlock-confirm     открыть после ожидания
+  tg-gate lock
+  tg-gate enforce            (таймер)
+
+Будни strict: max ${WEEKDAY_MAX_MINUTES}м, budget ${WEEKDAY_DAILY_BUDGET}м
+Выходные:     max ${WEEKEND_MAX_MINUTES}м, budget ${WEEKEND_DAILY_BUDGET}м
+Cooldown:     ${DEFAULT_COOLDOWN_MINUTES}м после unlock
+
+Config: $CONFIG
+Audit:  $AUDIT_LOG
+EOF
+}
+
+main() {
+  local cmd="${1:-status}"
+  shift || true
+  case "$cmd" in
+    status) cmd_status;;
+    open) cmd_open "$@";;
+    enforce) cmd_enforce;;
+    unlock) cmd_unlock "${1:-5}";;
+    unlock-confirm) cmd_unlock_confirm;;
+    lock) cmd_lock;;
+    edit) cmd_edit;;
+    install) cmd_install;;
+    uninstall) cmd_uninstall;;
+    -h|--help|help) usage;;
+    *) usage; exit 2;;
+  esac
+}
+
+main "$@"

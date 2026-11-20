@@ -1,169 +1,233 @@
 # App Gate
 
-Schedule-gated launcher for Linux desktop apps.
+Schedule-gated launchers for Linux desktop apps — friction against impulse
+opens (Telegram, emulators, etc.).
 
-You choose **when** an app is allowed to run. Outside those windows the menu
-launcher refuses to start it, and a per-minute systemd user timer closes it if
-it is already running. Optional PIN-protected **unlock** gives temporary access
-that always ends with a forced close.
+This repo contains:
 
-Built as a small pet project after living with Telegram / Genymotion addiction
-loops on a long computer workday.
+| Tool | Role |
+|------|------|
+| **`tg-gate`** | Opinionated Telegram gate: weekday/weekend modes, delayed unlock, daily budget, cooldown |
+| **`app-gate`** | Generic multi-app gate: simple `WINDOWS` + optional unlock per app |
 
-## Features
+Built as a pet project after a long workday + Telegram/Instagram loop.
 
-- Per-app config files (any binary or Flatpak)
-- Time windows (`HH:MM-HH:MM`, comma-separated, midnight wrap supported)
-- Emergency unlock with optional PIN (expires → process is killed even if a
-  schedule window is still open)
-- Desktop entry override + `systemd --user` timer (`OnCalendar=minutely`)
-- Example profiles for Telegram (Flatpak) and Genymotion (native)
+> This is **friction**, not security. You can always stop the timer or run
+> binaries by hand. The goal is to break the reflex, not to win against yourself
+> with rootkits.
 
 ## Requirements
 
-- Linux with `bash`, `systemd --user`
-- Optional: `notify-send`, `zenity` (nicer prompts)
-- Flatpak apps: `flatpak` CLI
+- Linux (`bash`, `systemd --user`)
+- `~/.local/bin` on your `PATH`
+- Optional: `notify-send`, `zenity`
+- For Telegram: Flatpak (`org.telegram.desktop`)
 
-## Quick start
+---
+
+## Install on a new machine
+
+### 1. Clone and link CLIs
 
 ```bash
 git clone https://github.com/SillyHatsOnly/app-gate.git
 cd app-gate
-chmod +x bin/app-gate
+./install.sh
+```
 
-# Install an example (copies config, desktop entry, timer)
-./bin/app-gate install telegram --from examples/telegram.conf
+This symlinks:
 
-# Edit windows / PIN / paths
-app-gate telegram edit
+- `~/.local/bin/app-gate`
+- `~/.local/bin/tg-gate`
 
-# Check state
-app-gate telegram status
+If `~/.local/bin` is missing from `PATH`, add to `~/.bashrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Then open a new terminal.
+
+### 2. Telegram (recommended path: `tg-gate`)
+
+```bash
+# Install Telegram if needed
+flatpak install -y flathub org.telegram.desktop
+
+# Desktop entry + minutely enforce timer + default config
+tg-gate install
+
+# Lock config against impulse edits
+chmod 444 ~/.config/tg-gate/config
+sudo chattr +i ~/.config/tg-gate/config   # optional but recommended
+
+tg-gate status
+```
+
+Menu “Telegram” now runs `tg-gate open`. The user timer `tg-gate.timer` kills
+the app outside allowed modes / after unlock expiry.
+
+### 3. Optional: Genymotion / other apps (`app-gate`)
+
+```bash
+# Edit paths in the example first (replace /home/YOU/...)
+nano examples/genymotion.conf
+./bin/app-gate install genymotion --from examples/genymotion.conf
+app-gate genymotion status
+```
+
+### 4. Uninstall
+
+```bash
+tg-gate uninstall          # timer + desktop; keeps config
+app-gate uninstall genymotion
+```
+
+---
+
+## `tg-gate` — schedule map
+
+Modes: **ban** (no access) · **open** (free) · **strict** / **weekend** (unlock only).
+
+### Monday / Wednesday / Friday
+
+| Time | Mode |
+|------|------|
+| 00:00–09:00 | ban |
+| 09:00–10:00 | open |
+| 10:00–20:00 | strict |
+| 20:00–22:00 | open |
+| 22:00–24:00 | ban |
+
+### Tuesday / Thursday
+
+| Time | Mode |
+|------|------|
+| 00:00–03:00 | ban |
+| 03:00–05:00 | open (early tourism) |
+| 05:00–09:00 | ban |
+| 09:00–20:00 | strict |
+| 20:00–22:00 | open |
+| 22:00–24:00 | ban |
+
+### Saturday / Sunday
+
+All day: **weekend** mode.
+
+### Limits
+
+| | Weekday `strict` | Weekend |
+|--|------------------|---------|
+| Max unlock slice | **5 min** | **20 min** |
+| Daily budget | **30 min** | **120 min** |
+| Unlock delay | **10 min** after phrase | same |
+| Cooldown after unlock | **3 hours** | same |
+
+Schedule logic is **hardcoded** in `bin/tg-gate` (not in the config file), so
+editing windows via a quick `nano` impulse does not reopen the old bypass.
+
+### Unlock flow
+
+```text
+tg-gate unlock 5
+    → shows the confirm phrase + warns about the wait
+    → you type: i need telegram
+    → 10 minute wait starts
+
+tg-gate unlock-confirm
+    → unlock becomes active for N minutes
+    → prints remaining daily budget (total − used)
+    → after expiry: kill + 3h cooldown
+```
+
+No PIN. After every successful unlock you see:
+
+```text
+Daily limit: Xm, used: Ym, left: Zm
+```
+
+(Russian UI strings in the live CLI; same numbers.)
+
+### Useful commands
+
+```bash
+tg-gate status
+tg-gate unlock 5
+tg-gate unlock-confirm
+tg-gate lock
+tg-gate install | uninstall
+```
+
+Audit log: `~/.local/state/tg-gate/audit.log`
+
+---
+
+## `app-gate` — generic multi-app gate
+
+Simple model: comma-separated `WINDOWS` plus optional unlock.
+
+```bash
+./install.sh
+app-gate install myapp --from examples/generic.conf
+app-gate myapp status
 app-gate list
 ```
 
-After install, the CLI is linked to `~/.local/bin/app-gate` (ensure that
-directory is on your `PATH`).
-
-## Commands
+### Commands
 
 ```text
-app-gate <app-id> status
-app-gate <app-id> open [--] [args...]
-app-gate <app-id> enforce          # used by the timer
-app-gate <app-id> unlock [minutes] # default 15; requires UNLOCK_PIN if set
-app-gate <app-id> lock
-app-gate <app-id> edit
-
+app-gate <app-id> status|open|enforce|unlock|lock|edit
 app-gate install <app-id> [--from PATH]
 app-gate uninstall <app-id>
 app-gate list
 ```
 
-## Config reference
-
-Configs live in:
-
-```text
-~/.config/app-gate/apps/<app-id>.conf
-```
+### Config (`~/.config/app-gate/apps/<id>.conf`)
 
 | Variable | Meaning |
 |----------|---------|
-| `APP_NAME` | Label in notifications / menu |
-| `WINDOWS` | Allowed ranges, e.g. `12:30-12:45,19:00-19:30` (end exclusive) |
-| `UNLOCK_PIN` | PIN for unlock; empty = no PIN |
+| `APP_NAME` | Label |
+| `WINDOWS` | e.g. `12:30-12:45,19:00-19:30` (end exclusive) |
 | `LAUNCH_MODE` | `command` or `flatpak` |
-| `LAUNCH_CMD` | Full command when `LAUNCH_MODE=command` |
-| `FLATPAK_ID` | Flatpak app id |
-| `FLATPAK_ARGS` | Extra args for `flatpak run` |
-| `STOP_CMD` | Optional graceful stop before kill |
-| `PROCESS_PATTERNS` | Comma-separated cmdline substrings for detect/kill |
-| `DESKTOP_*` | Menu entry filename, icon, categories, WM class |
+| `LAUNCH_CMD` / `FLATPAK_ID` | How to start |
+| `STOP_CMD` | Graceful stop before kill |
+| `PROCESS_PATTERNS` | Cmdline substrings for detect/kill |
+| `DESKTOP_*` | Menu entry fields |
+| `UNLOCK_PIN` | Optional (empty = none) |
 
-See `examples/generic.conf` for a filled template with comments.
+See `examples/generic.conf`.
 
-### Window semantics
+---
 
-- Format: `start-end` in 24-hour `HH:MM`
-- End is **exclusive**: `16:00-16:15` means until `16:14`
-- Crossing midnight: `23:00-00:30`
-
-### Unlock vs schedule
-
-| Situation | Behavior |
-|-----------|----------|
-| Inside `WINDOWS` | App may run |
-| Active unlock | App may run |
-| Unlock expires | App is **always** closed (even mid-schedule) |
-| Outside windows, no unlock | Launch blocked; timer kills leftovers |
-
-## How it works
+## How enforce works
 
 ```text
-Menu click ──► app-gate <id> open ──► allow? ──► start app
-                                   └─ no ──► notify / zenity
+Menu ──► *-gate open ──► allowed? ──► start
+                          └─ no ──► notify / block
 
-systemd timer (every minute)
-        └── app-gate <id> enforce
-                ├─ unlock expired? → kill
-                ├─ in schedule?    → keep
+systemd --user timer (every minute)
+        └── *-gate enforce
+                ├─ unlock expired? → kill (+ cooldown for tg-gate)
+                ├─ open period?    → keep
                 └─ else running?   → kill
 ```
 
-This is **friction**, not a security boundary. A determined user can stop the
-timer, edit the config, or launch the binary directly — the goal is to break
-impulse opens.
-
-## Examples
-
-### Telegram (Flatpak)
-
-```bash
-./bin/app-gate install telegram --from examples/telegram.conf
-app-gate telegram edit   # set WINDOWS + UNLOCK_PIN
-```
-
-The install writes `~/.local/share/applications/org.telegram.desktop.desktop`
-so the normal Telegram menu entry goes through the gate.
-
-### Genymotion
-
-```bash
-# Edit paths in the example first (replace /home/YOU/...)
-./bin/app-gate install genymotion --from examples/genymotion.conf
-```
-
-Uses `gmtool admin stopall` via `STOP_CMD`, then pattern kills for player/qemu.
-
-### Any other app
-
-```bash
-cp examples/generic.conf ~/.config/app-gate/apps/spotify.conf
-# fill LAUNCH_CMD / PROCESS_PATTERNS / WINDOWS
-./bin/app-gate install spotify
-```
-
-## Uninstall one app
-
-```bash
-app-gate uninstall telegram
-```
-
-Removes the timer and desktop override; keeps the config file.
+---
 
 ## Project layout
 
 ```text
-bin/app-gate              # main CLI
-examples/                 # ready-made configs
+bin/app-gate                 # generic multi-app CLI
+bin/tg-gate                  # Telegram schedule + strict unlock
+examples/
   generic.conf
-  telegram.conf
+  telegram.conf              # simple app-gate profile
+  tg-gate.config             # sample ~/.config/tg-gate/config
   genymotion.conf
-systemd/                  # documented unit templates
-LICENSE
+systemd/                     # documented unit templates for app-gate@
+install.sh                   # link CLIs + print fresh-system steps
 README.md
+LICENSE
 ```
 
 ## License
